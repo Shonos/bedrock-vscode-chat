@@ -8,7 +8,10 @@ import { convertTools } from "../converters/tools";
 import { validateRequest, validateTools } from "../validation";
 import { tryParseJSONObject } from "../converters/schema";
 import { ToolCallBufferManager } from "../tool-buffer";
-import { getProxyAgent } from "../clients/bedrock.client";
+import { BedrockClient, getProxyAgent } from "../clients/bedrock.client";
+import { OpenRouterClient } from "../services/openrouter.client";
+import { ModelService } from "../services/model.service";
+import type { BedrockModelSummary, AuthConfig } from "../types";
 import { getModelProfile } from "../profiles";
 import { buildRequestInput } from "../converters/request";
 import { StreamProcessor } from "../stream-processor";
@@ -574,6 +577,369 @@ suite("Bedrock Chat Provider Extension", () => {
 				convertTools({ toolMode: vscode.LanguageModelChatToolMode.Required, tools: [tool, { ...tool, name: "do_y" }] } as vscode.LanguageModelChatRequestHandleOptions, "anthropic.claude-3-5-sonnet-20241022-v2:0"),
 				/more than one tool/,
 			);
+		});
+	});
+
+	// ─── Inference Profile Overrides ────────────────────────────────────────
+	suite("ConfigurationService: inference profile overrides", () => {
+		let originalGetConfiguration: typeof vscode.workspace.getConfiguration;
+		setup(() => { originalGetConfiguration = vscode.workspace.getConfiguration; });
+		teardown(() => { (vscode.workspace as any).getConfiguration = originalGetConfiguration; });
+
+		test("returns empty object when no overrides are configured", () => {
+			(vscode.workspace as any).getConfiguration = () => ({
+				get: () => undefined,
+				has: () => false,
+				inspect: () => undefined,
+				update: async () => {},
+			});
+			const svc = new ConfigurationService();
+			assert.deepStrictEqual(svc.getInferenceProfileOverrides(), {});
+		});
+
+		test("returns empty object when key is missing entirely", () => {
+			(vscode.workspace as any).getConfiguration = () => ({
+				get: (key: string) => key === 'inferenceProfileOverrides' ? undefined : null,
+				has: () => true,
+				inspect: () => undefined,
+				update: async () => {},
+			});
+			const svc = new ConfigurationService();
+			assert.deepStrictEqual(svc.getInferenceProfileOverrides(), {});
+		});
+
+		test("returns user-provided overrides map", () => {
+			const overrides = {
+				"anthropic.claude-sonnet-4-6": "arn:aws:bedrock:ap-southeast-2:123456789012:application-inference-profile/abc123",
+				"anthropic.claude-opus-4-8": "arn:aws:bedrock:ap-southeast-2:123456789012:application-inference-profile/def456",
+			};
+			(vscode.workspace as any).getConfiguration = () => ({
+				get: (key: string) => key === 'inferenceProfileOverrides' ? overrides : undefined,
+				has: () => true,
+				inspect: () => undefined,
+				update: async () => {},
+			});
+			const svc = new ConfigurationService();
+			assert.deepStrictEqual(svc.getInferenceProfileOverrides(), overrides);
+		});
+
+		test("returns empty when overrides is set to null in settings.json", () => {
+			(vscode.workspace as any).getConfiguration = () => ({
+				get: (key: string) => key === 'inferenceProfileOverrides' ? null : undefined,
+				has: () => true,
+				inspect: () => undefined,
+				update: async () => {},
+			});
+			const svc = new ConfigurationService();
+			assert.deepStrictEqual(svc.getInferenceProfileOverrides(), {});
+		});
+	});
+
+	// ─── ModelService: invocation target resolution ─────────────────────────
+	suite("ModelService: invocation target resolution", () => {
+		let originalGetConfiguration: typeof vscode.workspace.getConfiguration;
+		let origFetchModels: typeof BedrockClient.prototype.fetchModels;
+		let origFetchProfiles: typeof BedrockClient.prototype.fetchInferenceProfiles;
+		let origGetModelProps: typeof OpenRouterClient.prototype.getModelProperties;
+
+		setup(() => {
+			originalGetConfiguration = vscode.workspace.getConfiguration;
+			origFetchModels = BedrockClient.prototype.fetchModels;
+			origFetchProfiles = BedrockClient.prototype.fetchInferenceProfiles;
+			origGetModelProps = OpenRouterClient.prototype.getModelProperties;
+		});
+
+		teardown(() => {
+			(vscode.workspace as any).getConfiguration = originalGetConfiguration;
+			BedrockClient.prototype.fetchModels = origFetchModels;
+			BedrockClient.prototype.fetchInferenceProfiles = origFetchProfiles;
+			OpenRouterClient.prototype.getModelProperties = origGetModelProps;
+		});
+
+		// Shared canned model — streaming text model that should pass the filter
+		const makeModel = (id: string, name?: string): BedrockModelSummary => ({
+			modelArn: `arn:aws:bedrock:us-east-1::foundation-model/${id}`,
+			modelId: id,
+			modelName: name ?? id,
+			providerName: "TestProvider",
+			inputModalities: ["TEXT"],
+			outputModalities: ["TEXT"],
+			responseStreamingSupported: true,
+		});
+
+		// Minimal auth mock — just enough to let getAuthConfig() succeed
+		function mockAuth(): AuthenticationService {
+			const cfg = new ConfigurationService();
+			const auth = new AuthenticationService(cfg);
+			// Stub getAuthConfig so it never tries real credential resolution
+			(auth as any).getAuthConfig = async () => ({ method: 'default' } as AuthConfig);
+			(auth as any).getCredentials = () => undefined;
+			return auth;
+		}
+
+		// Create a ConfigurationService that returns a given region + overrides
+		function mockConfig(region: string, overrides?: Record<string, string>): ConfigurationService {
+			const svc = new ConfigurationService();
+			(vscode.workspace as any).getConfiguration = (section?: string) => {
+				if (section === 'languageModelChatProvider.bedrock') {
+					return {
+						get: (key: string) => {
+							if (key === 'region') return region;
+							if (key === 'inferenceProfileOverrides') return overrides ?? undefined;
+							if (key === 'authMethod') return 'default';
+							return undefined;
+						},
+						has: () => true, inspect: () => undefined, update: async () => {},
+					};
+				}
+				return originalGetConfiguration(section);
+			};
+			return svc;
+		}
+
+		// Stub OpenRouter to avoid all network calls
+		function stubOpenRouter() {
+			OpenRouterClient.prototype.getModelProperties = async () => null as any;
+		}
+
+		test("user override takes precedence over system inference profiles", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('ap-southeast-2', {
+				"anthropic.claude-sonnet-4-6": "arn:aws:bedrock:ap-southeast-2:123456789012:application-inference-profile/xyz",
+			});
+
+			// System profiles that would normally match
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["apac.anthropic.claude-sonnet-4-6"]);
+			BedrockClient.prototype.fetchModels = async () => [makeModel("anthropic.claude-sonnet-4-6")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			await svc.getLanguageModelChatInformation(true);
+
+			// User override ARN wins, not the system profile
+			assert.equal(
+				svc.getInvocationTarget("anthropic.claude-sonnet-4-6"),
+				"arn:aws:bedrock:ap-southeast-2:123456789012:application-inference-profile/xyz"
+			);
+		});
+
+		test("apac.* system profile matches for ap-southeast-2 region", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('ap-southeast-2'); // no user overrides
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["apac.anthropic.claude-haiku-4-5"]);
+			BedrockClient.prototype.fetchModels = async () => [makeModel("anthropic.claude-haiku-4-5")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			await svc.getLanguageModelChatInformation(true);
+
+			assert.equal(
+				svc.getInvocationTarget("anthropic.claude-haiku-4-5"),
+				"apac.anthropic.claude-haiku-4-5"
+			);
+		});
+
+		test("apac.* also matches ap-northeast-1 region", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('ap-northeast-1');
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["apac.anthropic.claude-haiku-4-5"]);
+			BedrockClient.prototype.fetchModels = async () => [makeModel("anthropic.claude-haiku-4-5")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			await svc.getLanguageModelChatInformation(true);
+
+			assert.equal(
+				svc.getInvocationTarget("anthropic.claude-haiku-4-5"),
+				"apac.anthropic.claude-haiku-4-5"
+			);
+		});
+
+		test("us.* system profile matches for us-east-1 region", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('us-east-1');
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["us.anthropic.claude-3-5-sonnet-20241022-v2:0"]);
+			BedrockClient.prototype.fetchModels = async () =>
+				[makeModel("anthropic.claude-3-5-sonnet-20241022-v2:0")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			await svc.getLanguageModelChatInformation(true);
+
+			assert.equal(
+				svc.getInvocationTarget("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+				"us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+			);
+		});
+
+		test("au.* fallback when apac.* not available", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('ap-southeast-2');
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["au.anthropic.claude-haiku-4-5"]);
+			BedrockClient.prototype.fetchModels = async () => [makeModel("anthropic.claude-haiku-4-5")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			await svc.getLanguageModelChatInformation(true);
+
+			assert.equal(
+				svc.getInvocationTarget("anthropic.claude-haiku-4-5"),
+				"au.anthropic.claude-haiku-4-5"
+			);
+		});
+
+		test("global.* fallback when neither apac.* nor au.* available", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('ap-southeast-2');
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["global.anthropic.claude-haiku-4-5"]);
+			BedrockClient.prototype.fetchModels = async () => [makeModel("anthropic.claude-haiku-4-5")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			await svc.getLanguageModelChatInformation(true);
+
+			assert.equal(
+				svc.getInvocationTarget("anthropic.claude-haiku-4-5"),
+				"global.anthropic.claude-haiku-4-5"
+			);
+		});
+
+		test("first matching profile when none of the preferred prefixes match", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('ap-southeast-2');
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["eu.anthropic.claude-haiku-4-5"]);
+			BedrockClient.prototype.fetchModels = async () => [makeModel("anthropic.claude-haiku-4-5")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			await svc.getLanguageModelChatInformation(true);
+
+			// eu.* doesn't match apac/au/global priority, but it's the only candidate
+			assert.equal(
+				svc.getInvocationTarget("anthropic.claude-haiku-4-5"),
+				"eu.anthropic.claude-haiku-4-5"
+			);
+		});
+
+		test("no invocation target when no profile matches and no user override", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('us-east-1');
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () => new Set();
+			BedrockClient.prototype.fetchModels = async () => [makeModel("meta.llama3-70b-instruct-v1:0")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			await svc.getLanguageModelChatInformation(true);
+
+			assert.equal(
+				svc.getInvocationTarget("meta.llama3-70b-instruct-v1:0"),
+				undefined
+			);
+		});
+
+		test("public model ID stays bare even when invocation target is set", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('ap-southeast-2');
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["apac.anthropic.claude-haiku-4-5"]);
+			BedrockClient.prototype.fetchModels = async () => [makeModel("anthropic.claude-haiku-4-5", "Claude Haiku 4.5")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			const infos = await svc.getLanguageModelChatInformation(true);
+
+			assert.equal(infos.length, 1);
+			const info = infos[0] as vscode.LanguageModelChatInformation;
+			// The public model ID stays bare for capability detection
+			assert.equal(info.id, "anthropic.claude-haiku-4-5");
+			// But the invocation target maps to the system profile
+			assert.equal(svc.getInvocationTarget("anthropic.claude-haiku-4-5"), "apac.anthropic.claude-haiku-4-5");
+			// Detail reflects Multi-Region when a profile matched
+			assert.ok(info.detail!.includes("Multi-Region"), `detail should say Multi-Region, got: ${info.detail}`);
+		});
+
+		test("invocationTargets cleared between refreshes (stale targets removed)", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('ap-southeast-2');
+
+			// First refresh: model has a profile
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["apac.anthropic.claude-haiku-4-5"]);
+			BedrockClient.prototype.fetchModels = async () => [makeModel("anthropic.claude-haiku-4-5")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			await svc.getLanguageModelChatInformation(true);
+			assert.equal(svc.getInvocationTarget("anthropic.claude-haiku-4-5"), "apac.anthropic.claude-haiku-4-5");
+
+			// Second refresh: same model but NO profiles available now
+			BedrockClient.prototype.fetchInferenceProfiles = async () => new Set();
+			await svc.getLanguageModelChatInformation(true);
+
+			// The old target must be gone (map was cleared)
+			assert.equal(svc.getInvocationTarget("anthropic.claude-haiku-4-5"), undefined);
+		});
+
+		test("tooltip includes '(Cross-Region)' when inference profile matched", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('ap-southeast-2');
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["apac.anthropic.claude-haiku-4-5"]);
+			BedrockClient.prototype.fetchModels = async () => [makeModel("anthropic.claude-haiku-4-5", "Claude Haiku 4.5")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			const infos = await svc.getLanguageModelChatInformation(true);
+
+			assert.equal(infos.length, 1);
+			const info1 = infos[0] as vscode.LanguageModelChatInformation;
+			assert.ok(
+				info1.tooltip!.includes("Cross-Region"),
+				`tooltip should include Cross-Region, got: ${info1.tooltip}`
+			);
+		});
+
+		test("tooltip does NOT include '(Cross-Region)' when no profile matched", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('us-east-1');
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () => new Set();
+			BedrockClient.prototype.fetchModels = async () => [makeModel("meta.llama3-70b-instruct-v1:0", "Llama 3 70B")];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			const infos = await svc.getLanguageModelChatInformation(true);
+
+			assert.equal(infos.length, 1);
+			const info2 = infos[0] as vscode.LanguageModelChatInformation;
+			assert.ok(
+				!info2.tooltip!.includes("Cross-Region"),
+				`tooltip should NOT include Cross-Region, got: ${info2.tooltip}`
+			);
+			assert.equal(info2.detail, "TestProvider • us-east-1");
+		});
+
+		test("multiple models: mix of profiles and bare IDs", async () => {
+			stubOpenRouter();
+			const cfg = mockConfig('ap-southeast-2');
+
+			BedrockClient.prototype.fetchInferenceProfiles = async () =>
+				new Set(["apac.anthropic.claude-haiku-4-5"]);
+			BedrockClient.prototype.fetchModels = async () => [
+				makeModel("anthropic.claude-haiku-4-5", "Claude Haiku 4.5"),
+				makeModel("meta.llama3-70b-instruct-v1:0", "Llama 3 70B"),
+			];
+
+			const svc = new ModelService(mockAuth(), cfg);
+			const infos = await svc.getLanguageModelChatInformation(true);
+
+			assert.equal(infos.length, 2);
+			assert.equal(svc.getInvocationTarget("anthropic.claude-haiku-4-5"), "apac.anthropic.claude-haiku-4-5");
+			assert.equal(svc.getInvocationTarget("meta.llama3-70b-instruct-v1:0"), undefined);
 		});
 	});
 });

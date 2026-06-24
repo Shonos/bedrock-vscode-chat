@@ -1,0 +1,71 @@
+name: Auto Release on Version Bump
+
+# Trigger: every push to main — but only releases if package.json version changed
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # Step 1: Detect if the version field in package.json changed in this commit
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.detect.outputs.changed }}
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2                 # need the parent commit to diff
+
+      - name: Detect version change
+        id: detect
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          echo "current=$CURRENT"
+
+          # Handle first commit (no parent)
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            PREVIOUS=$(git show HEAD~1:package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+          else
+            PREVIOUS=""
+          fi
+          echo "previous=$PREVIOUS"
+
+          if [ "$CURRENT" != "$PREVIOUS" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+            echo "✅ Version changed: $PREVIOUS → $CURRENT — will release"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️  Version unchanged ($CURRENT) — skipping release"
+          fi
+
+  # Step 2: Build VSIX and create GitHub Release (only if version changed)
+  build-and-release:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write                    # needed for gh release create
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+
+      - name: Package VSIX
+        run: npx @vscode/vsce package -o extension.vsix
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          gh release create "v${VERSION}" \
+            ./extension.vsix \
+            --title "v${VERSION}" \
+            --generate-notes
