@@ -8,26 +8,10 @@ Integrates AWS Bedrock foundation models into GitHub Copilot Chat for VS Code, w
 
 ## Installation
 
-This extension is **not published on the VS Code Marketplace**. Build and install it from source:
+This extension is **not published on the VS Code Marketplace**. Download the latest `.vsix` from the [GitHub Releases page](https://github.com/Shonos/bedrock-vscode-chat/releases), then install it (replace `x.x.x` with the version you downloaded):
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/shonos/bedrock-vscode-chat.git
-cd bedrock-vscode-chat
-
-# 2. Install dependencies
-npm install
-
-# 3. Build and package the .vsix
-npx @vscode/vsce package
-```
-
-This produces `bedrock-vscode-chat-with-inference-profile-support-0.0.1.vsix`.
-
-**Install the .vsix:**
-
-```bash
-code --install-extension bedrock-vscode-chat-with-inference-profile-support-0.0.1.vsix
+code --install-extension bedrock-vscode-chat-with-inference-profile-support-x.x.x.vsix
 ```
 
 Or via the UI: `Ctrl+Shift+P` → **Extensions: Install from VSIX...** → select the `.vsix` file.

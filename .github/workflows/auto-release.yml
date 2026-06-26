@@ -58,14 +58,15 @@ jobs:
       - run: npm ci
 
       - name: Package VSIX
-        run: npx @vscode/vsce package -o extension.vsix
+        run: npx @vscode/vsce package
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
+          VSIX="bedrock-vscode-chat-with-inference-profile-support-${VERSION}.vsix"
           gh release create "v${VERSION}" \
-            ./extension.vsix \
+            "./${VSIX}" \
             --title "v${VERSION}" \
             --generate-notes
