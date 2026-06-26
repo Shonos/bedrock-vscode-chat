@@ -73,4 +73,13 @@ export class ConfigurationService {
 		const config = vscode.workspace.getConfiguration(this.configSection);
 		return config.get<Record<string, string>>('inferenceProfileOverrides') ?? {};
 	}
+
+	/**
+	 * Check if OpenRouter metadata fetching is enabled.
+	 * Defaults to false — user must explicitly opt in to third-party requests.
+	 */
+	getEnableOpenRouterMetadata(): boolean {
+		const config = vscode.workspace.getConfiguration(this.configSection);
+		return config.get<boolean>('enableOpenRouterMetadata') ?? false;
+	}
 }

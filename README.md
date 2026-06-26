@@ -95,6 +95,7 @@ Configure the extension through VS Code settings (Cmd/Ctrl + , then search for "
 - **Access Key ID / Secret Access Key**: AWS credentials (when using access-keys method)
 - **Session Token**: AWS Session Token for temporary credentials (optional, used with access-keys method)
 - **Inference Profile Overrides**: Map model IDs to application inference profile ARNs for models that require them (see [Inference Profiles](#inference-profiles) below)
+- **Enable OpenRouter Metadata**: (Opt-in, default: `false`) Fetch model context length and max output tokens from OpenRouter. When disabled, conservative defaults are used (200K input, 4,096 output). Enable only if you consent to contacting openrouter.ai, a third-party service
 
 ### Inference Profiles
 
@@ -147,6 +148,15 @@ Press F5 to launch an Extension Development Host.
 - **Image/vision input requires being signed in to GitHub Copilot Chat.** When signed out (using Bedrock purely as a bring-your-own-key provider), VS Code's chat agent strips image attachments before they reach *any* model provider — so vision-capable Bedrock models will only receive the text. This is a VS Code Copilot Chat gate, not a limitation of this extension. Text and tool calling work either way.
 - Some models don't support streaming with tool calls simultaneously
 - Rate limits apply based on your AWS account settings
+- **Model context/output limits use conservative defaults** (200K input, 4,096 output tokens) unless you opt in to OpenRouter metadata. Models with larger context windows may appear capped; models with smaller windows may get API errors if requests exceed their limits.
+
+## Privacy
+
+This extension sends data **only to AWS** — specifically to `bedrock.{region}.amazonaws.com` and `bedrock-runtime.{region}.amazonaws.com`. No telemetry, analytics, or third-party services are contacted unless you explicitly opt in:
+
+- **OpenRouter metadata** (`enableOpenRouterMetadata`): Disabled by default. If enabled, a request is sent to `openrouter.ai` once every 24 hours to fetch model capability metadata.
+
+All credentials (API keys, access keys, session tokens) are stored locally in VS Code settings and never transmitted outside of AWS SDK calls.
 
 ## Resources
 

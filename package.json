@@ -88,6 +88,12 @@
 					"additionalProperties": {
 						"type": "string"
 					}
+				},
+				"languageModelChatProvider.bedrock.enableOpenRouterMetadata": {
+					"type": "boolean",
+					"description": "Fetch model metadata (context length, max output tokens) from OpenRouter (openrouter.ai). This sends a request to a third-party service. Disabled by default.",
+					"title": "Enable OpenRouter Metadata",
+					"default": false
 				}
 			}
 		},

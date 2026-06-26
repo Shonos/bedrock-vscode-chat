@@ -103,10 +103,15 @@ export class ModelService {
 
 			const hasInferenceProfile = this.invocationTargets.has(m.modelId);
 
-			// Try to get model properties from OpenRouter, fall back to defaults
-			const properties = await this.openRouterClient.getModelProperties(m.modelId);
-			const maxInput = properties?.contextLength ?? DEFAULT_CONTEXT_LENGTH;
-			const maxOutput = properties?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+			// Only fetch OpenRouter metadata if the user has explicitly opted in.
+			// Defaults to hardcoded estimates to avoid third-party network calls.
+			let maxInput = DEFAULT_CONTEXT_LENGTH;
+			let maxOutput = DEFAULT_MAX_OUTPUT_TOKENS;
+			if (this.configService.getEnableOpenRouterMetadata()) {
+				const properties = await this.openRouterClient.getModelProperties(m.modelId);
+				maxInput = properties?.contextLength ?? DEFAULT_CONTEXT_LENGTH;
+				maxOutput = properties?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+			}
 			const vision = m.inputModalities.includes("IMAGE");
 
 			const modelInfo: LanguageModelChatInformation = {
